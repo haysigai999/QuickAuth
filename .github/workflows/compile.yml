@@ -2,7 +2,7 @@ name: Multi-Arch Compile and Release
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main","fix/windows-compat" ]
 
 permissions:
   contents: write
