@@ -20,11 +20,44 @@ import urllib.error
 from pathlib import Path
 
 # --- Platform Support ---
-if os.name == 'nt':
-    # Enable ANSI escape sequences on Windows
-    os.system('color')
+IS_WINDOWS = (os.name == 'nt')
+
+if IS_WINDOWS:
+    import msvcrt
     import ctypes
     from ctypes import wintypes
+
+    def _enable_windows_ansi():
+        """Force-enable ANSI/VT100 escape sequence processing on Windows
+        consoles (cmd.exe / PowerShell). Falls back silently if it fails
+        (e.g. output is redirected to a file)."""
+        try:
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            STD_OUTPUT_HANDLE = -11
+            STD_INPUT_HANDLE = -10
+            kernel32 = ctypes.windll.kernel32
+            for handle_id in (STD_OUTPUT_HANDLE, STD_INPUT_HANDLE):
+                handle = kernel32.GetStdHandle(handle_id)
+                mode = wintypes.DWORD()
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        except Exception:
+            pass
+        # Legacy fallback trick, harmless if the above already worked.
+        try:
+            os.system('')
+        except Exception:
+            pass
+
+    _enable_windows_ansi()
+
+    # Make sure UTF-8 (emojis, Vietnamese diacritics, etc.) prints correctly
+    # on Windows consoles instead of raising UnicodeEncodeError.
+    for _stream in (sys.stdout, sys.stderr, sys.stdin):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
@@ -100,7 +133,7 @@ IS_COMPILED = getattr(sys, 'frozen', False) or "__compiled__" in globals()
 def get_env_info():
     if os.path.exists('/data/data/com.termux'):
         return "Android (Termux)"
-    elif os.name == 'nt':
+    elif IS_WINDOWS:
         return "Windows"
     elif sys.platform == 'darwin':
         return "macOS"
@@ -139,7 +172,7 @@ def load_data(file_path, decrypt=True):
     try:
         with open(file_path, "rb") as f:
             raw = f.read()
-            if decrypt and os.name == 'nt' and raw:
+            if decrypt and IS_WINDOWS and raw:
                 try: raw = win_decrypt(raw)
                 except: pass
             return json.loads(raw.decode("utf-8"))
@@ -153,7 +186,7 @@ def save_data(file_path, data, encrypt=True):
                 file_path.parent.mkdir(parents=True, exist_ok=True)
             
             content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-            if encrypt and os.name == 'nt':
+            if encrypt and IS_WINDOWS:
                 try: content = win_encrypt(content)
                 except: pass
             
@@ -238,6 +271,12 @@ def totp_code(secret_bytes: bytes, for_time: int = None, digits: int = DIGITS, s
 # --- Raw Terminal Input ---
 class RawTerminal:
     def __enter__(self):
+        if IS_WINDOWS:
+            # msvcrt needs no raw-mode setup; the console already delivers
+            # keys one at a time. Classic Windows consoles don't support
+            # SGR mouse reporting, so we skip enabling it here (menus still
+            # work fully with the keyboard).
+            return self
         import termios, tty
         self.fd = sys.stdin.fileno()
         self.old_settings = termios.tcgetattr(self.fd)
@@ -248,6 +287,8 @@ class RawTerminal:
         return self
 
     def __exit__(self, type, value, traceback):
+        if IS_WINDOWS:
+            return
         import termios
         # Disable mouse reporting
         sys.stdout.write("\033[?1000l\033[?1006l")
@@ -255,6 +296,8 @@ class RawTerminal:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
 
     def get_key(self):
+        if IS_WINDOWS:
+            return self._get_key_windows()
         if not select.select([sys.stdin], [], [], 0.1)[0]:
             return None
         c = sys.stdin.read(1)
@@ -282,6 +325,42 @@ class RawTerminal:
         elif c == '\x03': return "CTRL_C"
         elif c == '\x7f': return "BACKSPACE"
         return c
+
+    def _get_key_windows(self):
+        """msvcrt-based equivalent of the termios/select reader above.
+        Polls for ~0.1s (same timeout behaviour as the Unix branch) so
+        callers relying on `None` meaning "no key yet" keep working."""
+        waited = 0.0
+        while not msvcrt.kbhit():
+            if waited >= 0.1:
+                return None
+            time.sleep(0.01)
+            waited += 0.01
+
+        ch = msvcrt.getwch()
+        # Arrow / function keys arrive as a two-character sequence prefixed
+        # with '\x00' or '\xe0'.
+        if ch in ('\x00', '\xe0'):
+            ch2 = msvcrt.getwch()
+            return {
+                'H': "UP",
+                'P': "DOWN",
+                'M': "RIGHT",
+                'K': "LEFT",
+            }.get(ch2, None)
+        elif ch in ('\r', '\n'):
+            return "ENTER"
+        elif ch == ' ':
+            return "SPACE"
+        elif ch == '\t':
+            return "TAB"
+        elif ch == '\x03':
+            return "CTRL_C"
+        elif ch == '\x08':
+            return "BACKSPACE"
+        elif ch == '\x1b':
+            return "ESC"
+        return ch
 
 def parse_mouse_sgr(data):
     # data format: "button;x;yM" or "button;x;ym"
@@ -668,7 +747,10 @@ def show_live_otps(store, keys):
     stop_event = threading.Event()
     def wait_input():
         with RawTerminal(): # temporarily enter raw to catch any key
-            sys.stdin.read(1)
+            if IS_WINDOWS:
+                msvcrt.getwch()
+            else:
+                sys.stdin.read(1)
             stop_event.set()
     
     t = threading.Thread(target=wait_input, daemon=True)
