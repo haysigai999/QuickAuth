@@ -130,20 +130,41 @@ class Style:
 # --- Environment Detection ---
 IS_COMPILED = getattr(sys, 'frozen', False) or "__compiled__" in globals()
 
-def get_env_info():
-    if os.path.exists('/data/data/com.termux'):
+def get_env_info() -> str:
+    if os.path.exists("/data/data/com.termux"):
         return "Android (Termux)"
     elif IS_WINDOWS:
         return "Windows"
-    elif sys.platform == 'darwin':
+    elif sys.platform == "darwin":
         return "macOS"
-    elif sys.platform == 'linux':
+    elif sys.platform.startswith("linux"):
         return "Linux"
     return f"Python ({sys.platform})"
 
+
 # --- Storage Logic ---
-BASE_DIR = Path.home() / ".teralone_auth" if IS_COMPILED else Path(".")
+def get_base_dir() -> Path:
+    if not IS_COMPILED:
+        return Path(".")
+
+    # Khi đã đóng gói, lưu config vào thư mục phù hợp với từng OS
+    if IS_WINDOWS:
+        appdata = os.getenv("APPDATA")
+        return (
+            Path(appdata) / ".teralone_auth"
+            if appdata
+            else Path.home() / ".teralone_auth"
+        )
+    elif sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "teralone_auth"
+    else:
+        # Linux / Android (Termux)
+        return Path.home() / ".teralone_auth"
+
+
+BASE_DIR = get_base_dir()
 CONFIG_FILE = BASE_DIR / "config.json"
+
 
 def get_current_user():
     if not CONFIG_FILE.exists(): return "user"
